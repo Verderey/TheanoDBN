@@ -1,5 +1,10 @@
 """
+Author: Reuben Feinman
+CAML @ Symantec
+
+Stencil code provided by www.deeplearning.com/tutorial/code
 """
+
 import os
 import sys
 import time
@@ -11,7 +16,6 @@ import numpy
 import theano
 import theano.tensor as T
 from theano.compat import six
-from theano.tensor.shared_randomstreams import RandomStreams
 from theano.sandbox.rng_mrg import MRG_RandomStreams
 
 from logistic_sgd import LogisticRegression, load_data
@@ -19,7 +23,6 @@ from mlp import HiddenLayer, DropoutHiddenLayer, _dropout_from_layer
 from rbm import RBM
 
 
-# start-snippet-1
 class DBN(object):
     """Deep Belief Network
 
@@ -68,7 +71,6 @@ class DBN(object):
         assert self.n_layers > 0
 
         if not theano_rng:
-            #theano_rng = RandomStreams(numpy_rng.randint(2 ** 30))
             theano_rng = MRG_RandomStreams(numpy_rng.randint(2 ** 30))
 
         # allocate symbolic variables for the data

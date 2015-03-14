@@ -1,25 +1,13 @@
 """
-This tutorial introduces the multilayer perceptron using Theano.
+Author: Reuben Feinman
+CAML @ Symantec
 
- A multilayer perceptron is a logistic regressor where
-instead of feeding the input to the logistic regression you insert a
-intermediate layer, called the hidden layer, that has a nonlinear
-activation function (usually tanh or sigmoid) . One can use many such
-hidden layers making the architecture deep. The tutorial will also tackle
-the problem of MNIST digit classification.
-
-.. math::
-
-    f(x) = G( b^{(2)} + W^{(2)}( s( b^{(1)} + W^{(1)} x))),
+Stencil code provided by www.deeplearning.com/tutorial/code
 
 References:
-
     - textbooks: "Pattern Recognition and Machine Learning" -
                  Christopher M. Bishop, section 5
-
 """
-__docformat__ = 'restructedtext en'
-
 
 import os
 import sys
@@ -66,20 +54,11 @@ class HiddenLayer(object):
                            layer
         """
         self.input = input
-        # end-snippet-1
 
-        # `W` is initialized with `W_values` which is uniformely sampled
-        # from sqrt(-6./(n_in+n_hidden)) and sqrt(6./(n_in+n_hidden))
-        # for tanh activation function
-        # the output of uniform if converted using asarray to dtype
-        # theano.config.floatX so that the code is runable on GPU
-        # Note : optimal initialization of weights is dependent on the
-        #        activation function used (among other things).
-        #        For example, results presented in [Xavier10] suggest that you
-        #        should use 4 times larger initial weights for sigmoid
-        #        compared to tanh
-        #        We have no info for other function, so we use the same as
-        #        tanh.
+        '''
+        Sparse initialization scheme from section 3.1 of Hinton's paper:
+        http://www.cs.toronto.edu/~hinton/absps/momentum.pdf
+        '''
         num_connections = 10
         scale = 0.8
 
@@ -128,7 +107,6 @@ class DropoutHiddenLayer(HiddenLayer):
         self.output = _dropout_from_layer(rng, self.output, p=dropout_rate)
 
 
-# start-snippet-2
 class MLP(object):
     """Multi-Layer Perceptron Class
 

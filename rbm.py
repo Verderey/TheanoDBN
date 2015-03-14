@@ -1,16 +1,12 @@
-"""This tutorial introduces restricted boltzmann machines (RBM) using Theano.
-
-Boltzmann Machines (BMs) are a particular form of energy-based model which
-contain hidden variables. Restricted Boltzmann Machines further restrict BMs
-to those without visible-visible and hidden-hidden connections.
 """
+Author: Reuben Feinman
+CAML @ Symantec
+
+Stencil code provided by www.deeplearning.com/tutorial/code
+"""
+
 import time
 from collections import OrderedDict
-
-try:
-    import PIL.Image as Image
-except ImportError:
-    import Image
 
 import numpy
 
@@ -18,9 +14,8 @@ import theano
 import theano.tensor as T
 import os
 
-from theano.tensor.shared_randomstreams import RandomStreams
+from theano.sandbox.rng_mrg import MRG_RandomStreams
 
-from utils import tile_raster_images
 from logistic_sgd import load_data
 
 
@@ -70,24 +65,24 @@ class RBM(object):
             numpy_rng = numpy.random.RandomState(1234)
 
         if theano_rng is None:
-            theano_rng = RandomStreams(numpy_rng.randint(2 ** 30))
+            theano_rng = MRG_RandomStreams(numpy_rng.randint(2 ** 30))
+
+        '''
+        Sparse initialization scheme from section 3.1 of Hinton's paper:
+        http://www.cs.toronto.edu/~hinton/absps/momentum.pdf
+        '''
+        num_connections = 10
+        scale = 0.8
 
         if W is None:
-            # W is initialized with `initial_W` which is uniformely
-            # sampled from -4*sqrt(6./(n_visible+n_hidden)) and
-            # 4*sqrt(6./(n_hidden+n_visible)) the output of uniform if
-            # converted using asarray to dtype theano.config.floatX so
-            # that the code is runable on GPU
-            initial_W = numpy.asarray(
-                numpy_rng.uniform(
-                    low=-4 * numpy.sqrt(6. / (n_hidden + n_visible)),
-                    high=4 * numpy.sqrt(6. / (n_hidden + n_visible)),
-                    size=(n_visible, n_hidden)
-                ),
-                dtype=theano.config.floatX
-            )
-            # theano shared variables for weights and biases
-            W = theano.shared(value=initial_W, name='W')
+            indices = range(n_in)
+            weights = numpy.zeros((n_in, n_out),dtype=theano.config.floatX)
+            for i in range(n_out):
+                random.shuffle(indices)
+                for j in indices[:num_connections]:
+                    weights[j,i] = random.gauss(0.0, scale)
+
+            W = theano.shared(value=weights, name='W', borrow=True)
 
         if hbias is None:
             # create shared variable for hidden units bias
@@ -109,19 +104,6 @@ class RBM(object):
                 name='vbias'
             )
 
-        """
-        if vbias is None:
-            # create shared variable for visible units bias
-            vbias = theano.shared(
-                value=numpy.zeros(
-                    n_visible,
-                    dtype=theano.config.floatX
-                ),
-                name='vbias',
-                borrow=True
-            )
-        """
-
         # initialize input layer for standalone RBM or layer0 of DBN
         self.input = input
         if not input:
@@ -134,7 +116,6 @@ class RBM(object):
         # **** WARNING: It is not a good idea to put things in this list
         # other than shared variables created in this function.
         self.params = [self.W, self.hbias, self.vbias]
-        # end-snippet-1
 
     def free_energy(self, v_sample):
         ''' Function to compute the free energy '''
@@ -215,7 +196,7 @@ class RBM(object):
                 pre_sigmoid_v1, v1_mean, v1_sample]
 
     # start-snippet-2
-    def get_cost_updates(self, lr=0.1, persistent=None, k=1, mom=0.9):
+    def get_cost_updates(self, lr=0.1, persistent=None, k=1, momentum=0.9):
         """This functions implements one step of CD-k or PCD-k
 
         :param lr: learning rate used to train the RBM
@@ -276,10 +257,9 @@ class RBM(object):
         rbm_cost = T.mean(self.free_energy(self.input)) - T.mean(
             self.free_energy(chain_end))
 
-        """
         def rmsprop(cost, learning_rate, rho=0.9, epsilon=1e-10): 
             # Return the dictionary of parameter specific learning rate updates 
-            # using adagrad algorithm. 
+            # using adagrad algorithm.
 
             def safe_update(dict_to, dict_from):
                 # Like dict_to.update(dict_from), except don't overwrite any keys.
@@ -303,7 +283,7 @@ class RBM(object):
             for param, gp in zip(self.params, gparams): 
                 acc = accumulators[param] 
                 ups[acc] = rho * acc + (1 - rho) * T.sqr(gp)
-                val = T.sqrt(ups[acc]) + epsilon 
+                val = T.maximum(T.sqrt(T.sum(ups[acc])), epsilon)
                 learn_rates.append(learning_rate / val)
 
             if momentum > 0: 
@@ -334,6 +314,7 @@ class RBM(object):
         updates = rmsprop(cost=rbm_cost, learning_rate=lr)
 
         """
+
         # We must not compute the gradient through the gibbs sampling
         gparams = T.grad(rbm_cost, self.params, consider_constant=[chain_end])
         # end-snippet-3 start-snippet-4
@@ -348,13 +329,14 @@ class RBM(object):
         updates = OrderedDict()
         for gparam_mom, gparam in zip(gparams_mom, gparams):
             # change the update rule to match Hinton's dropout paper
-            updates[gparam_mom] = mom * gparam_mom - (1. - mom) * gparam * T.cast(lr, dtype=theano.config.floatX)
+            updates[gparam_mom] = momentum * gparam_mom - (1. - momentum) * gparam * T.cast(lr, dtype=theano.config.floatX)
 
         # ... and take a step along that direction
         for param, gparam_mom in zip(self.params, gparams_mom):
             # since we have included learning_rate in gparam_mom, we don't need it
             # here
             updates[param] = param + updates[gparam_mom]
+        """
 
         if persistent:
             # Note that this works only if persistent is a shared variable
@@ -442,186 +424,3 @@ class RBM(object):
         cost = T.sum(T.sqr(self.input - T.nnet.sigmoid(pre_sigmoid_nv)))
 
         return cost
-
-
-def test_rbm(learning_rate=0.1, training_epochs=15,
-             dataset='mnist.pkl.gz', batch_size=20,
-             n_chains=20, n_samples=10, output_folder='rbm_plots',
-             n_hidden=500):
-    """
-    Demonstrate how to train and afterwards sample from it using Theano.
-
-    This is demonstrated on MNIST.
-
-    :param learning_rate: learning rate used for training the RBM
-
-    :param training_epochs: number of epochs used for training
-
-    :param dataset: path the the pickled dataset
-
-    :param batch_size: size of a batch used to train the RBM
-
-    :param n_chains: number of parallel Gibbs chains to be used for sampling
-
-    :param n_samples: number of samples to plot for each chain
-
-    """
-    datasets = load_data(dataset)
-
-    train_set_x, train_set_y = datasets[0]
-    test_set_x, test_set_y = datasets[2]
-
-    # compute number of minibatches for training, validation and testing
-    n_train_batches = train_set_x.get_value().shape[0] / batch_size
-
-    # allocate symbolic variables for the data
-    index = T.lscalar()    # index to a [mini]batch
-    x = T.matrix('x')  # the data is presented as rasterized images
-
-    rng = numpy.random.RandomState(123)
-    theano_rng = RandomStreams(rng.randint(2 ** 30))
-
-    # initialize storage for the persistent chain (state = hidden
-    # layer of chain)
-    persistent_chain = theano.shared(numpy.zeros((batch_size, n_hidden),
-                                                 dtype=theano.config.floatX))
-
-    # construct the RBM class
-    rbm = RBM(input=x, n_visible=28 * 28,
-              n_hidden=n_hidden, numpy_rng=rng, theano_rng=theano_rng)
-
-    # get the cost and the gradient corresponding to one step of CD-15
-    cost, updates = rbm.get_cost_updates(lr=learning_rate,
-                                         persistent=persistent_chain, k=15)
-
-    #################################
-    #     Training the RBM          #
-    #################################
-    if not os.path.isdir(output_folder):
-        os.makedirs(output_folder)
-    os.chdir(output_folder)
-
-    # start-snippet-5
-    # it is ok for a theano function to have no output
-    # the purpose of train_rbm is solely to update the RBM parameters
-    train_rbm = theano.function(
-        [index],
-        cost,
-        updates=updates,
-        givens={
-            x: train_set_x[index * batch_size: (index + 1) * batch_size]
-        },
-        name='train_rbm'
-    )
-
-    plotting_time = 0.
-    start_time = time.clock()
-
-    # go through training epochs
-    for epoch in xrange(training_epochs):
-
-        # go through the training set
-        mean_cost = []
-        for batch_index in xrange(n_train_batches):
-            mean_cost += [train_rbm(batch_index)]
-
-        print 'Training epoch %d, cost is ' % epoch, numpy.mean(mean_cost)
-
-        # Plot filters after each training epoch
-        plotting_start = time.clock()
-        # Construct image from the weight matrix
-        image = Image.fromarray(
-            tile_raster_images(
-                X=rbm.W.get_value(borrow=True).T,
-                img_shape=(28, 28),
-                tile_shape=(10, 10),
-                tile_spacing=(1, 1)
-            )
-        )
-        image.save('filters_at_epoch_%i.png' % epoch)
-        plotting_stop = time.clock()
-        plotting_time += (plotting_stop - plotting_start)
-
-    end_time = time.clock()
-
-    pretraining_time = (end_time - start_time) - plotting_time
-
-    print ('Training took %f minutes' % (pretraining_time / 60.))
-    # end-snippet-5 start-snippet-6
-    #################################
-    #     Sampling from the RBM     #
-    #################################
-    # find out the number of test samples
-    number_of_test_samples = test_set_x.get_value(borrow=True).shape[0]
-
-    # pick random test examples, with which to initialize the persistent chain
-    test_idx = rng.randint(number_of_test_samples - n_chains)
-    persistent_vis_chain = theano.shared(
-        numpy.asarray(
-            test_set_x.get_value(borrow=True)[test_idx:test_idx + n_chains],
-            dtype=theano.config.floatX
-        )
-    )
-    # end-snippet-6 start-snippet-7
-    plot_every = 1000
-    # define one step of Gibbs sampling (mf = mean-field) define a
-    # function that does `plot_every` steps before returning the
-    # sample for plotting
-    (
-        [
-            presig_hids,
-            hid_mfs,
-            hid_samples,
-            presig_vis,
-            vis_mfs,
-            vis_samples
-        ],
-        updates
-    ) = theano.scan(
-        rbm.gibbs_vhv,
-        outputs_info=[None, None, None, None, None, persistent_vis_chain],
-        n_steps=plot_every
-    )
-
-    # add to updates the shared variable that takes care of our persistent
-    # chain :.
-    updates.update({persistent_vis_chain: vis_samples[-1]})
-    # construct the function that implements our persistent chain.
-    # we generate the "mean field" activations for plotting and the actual
-    # samples for reinitializing the state of our persistent chain
-    sample_fn = theano.function(
-        [],
-        [
-            vis_mfs[-1],
-            vis_samples[-1]
-        ],
-        updates=updates,
-        name='sample_fn'
-    )
-
-    # create a space to store the image for plotting ( we need to leave
-    # room for the tile_spacing as well)
-    image_data = numpy.zeros(
-        (29 * n_samples + 1, 29 * n_chains - 1),
-        dtype='uint8'
-    )
-    for idx in xrange(n_samples):
-        # generate `plot_every` intermediate samples that we discard,
-        # because successive samples in the chain are too correlated
-        vis_mf, vis_sample = sample_fn()
-        print ' ... plotting sample ', idx
-        image_data[29 * idx:29 * idx + 28, :] = tile_raster_images(
-            X=vis_mf,
-            img_shape=(28, 28),
-            tile_shape=(1, n_chains),
-            tile_spacing=(1, 1)
-        )
-
-    # construct image
-    image = Image.fromarray(image_data)
-    image.save('samples.png')
-    # end-snippet-7
-    os.chdir('../')
-
-if __name__ == '__main__':
-    test_rbm()
