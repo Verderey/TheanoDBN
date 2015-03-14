@@ -241,7 +241,7 @@ class DBN(object):
             # using CD-k here (persisent=None) for training each RBM.
             # TODO: change cost function to reconstruction error
             cost, updates = rbm.get_cost_updates(learning_rate,
-                                                 persistent=None, k=k, mom=momentum)
+                                                 persistent=None, k=k, momentum=momentum)
 
             # compile the theano function
             fn = theano.function(
@@ -454,7 +454,6 @@ def test_DBN(finetune_lr=0.1, pretraining_epochs=200,
               dropout_rates=[0.8, 0.7, 0.7],
               n_outs=10)
 
-    # start-snippet-2
     #########################
     # PRETRAINING THE MODEL #
     #########################
@@ -480,7 +479,6 @@ def test_DBN(finetune_lr=0.1, pretraining_epochs=200,
             print 'Pre-training layer %i, secs %f, epoch %d, cost ' % (i, time.time() - time0, epoch), total_cost
 
     end_time = time.clock()
-    # end-snippet-2
     print >> sys.stderr, ('The pretraining code for file ' +
                           os.path.split(__file__)[1] +
                           ' ran for %.2fm' % ((end_time - start_time) / 60.))

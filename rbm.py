@@ -6,13 +6,14 @@ Stencil code provided by www.deeplearning.com/tutorial/code
 """
 
 import time
+import os
 from collections import OrderedDict
 
 import numpy
 
 import theano
 import theano.tensor as T
-import os
+from theano.compat import six
 
 from theano.sandbox.rng_mrg import MRG_RandomStreams
 
