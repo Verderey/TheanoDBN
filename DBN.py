@@ -290,69 +290,9 @@ class DBN(object):
             train_cost = self.dropout_negative_log_likelihood(self.y)
         else:
             train_cost = self.negative_log_likelihood(self.y)
-
         errors = self.errors(self.y)
 
         def rmsprop(cost, lr, rho=0.9, epsilon=1e-10): 
-            # Return the dictionary of parameter specific learning rate updates 
-            # using adagrad algorithm.
-
-            def safe_update(dict_to, dict_from):
-                # Like dict_to.update(dict_from), except don't overwrite any keys.
-                for key, val in six.iteritems(dict_from):
-                    if key in dict_to:
-                        raise KeyError(key)
-                    dict_to[key] = val
-                return dict_to
-
-            #Initialize the variables 
-            accumulators = OrderedDict({}) 
-            e0s = OrderedDict({}) 
-            learn_rates = [] 
-            ups = OrderedDict({}) 
-            eps = OrderedDict({}) 
-            #initialize the accumulator and the epsilon_0 
-            for param in self.params: 
-                eps_p = numpy.zeros_like(param.get_value()) 
-                accumulators[param] = theano.shared(value=numpy.cast[theano.config.floatX](eps_p), name="acc_%s" % param.name) 
-                e0s[param] = numpy.cast[theano.config.floatX](lr)
-                eps_p[:] = epsilon 
-                eps[param] = theano.shared(value=eps_p, name="eps_%s" % param.name)
-
-            gparams = T.grad(cost, self.params)
-
-            for param, gp in zip(self.params, gparams): 
-                acc = accumulators[param] 
-                ups[acc] = rho * acc + (1 - rho) * T.sqr(gp)
-                val = T.sqrt(T.sum(ups[acc])) + epsilon 
-                learn_rates.append(e0s[param] / val) #T.maximum(ups[acc], eps[param]))
-
-            if momentum > 0: 
-                # ... and allocate mmeory for momentum'd versions of the gradient 
-                gparams_mom = [] 
-                for param in self.params: 
-                    gparam_mom = theano.shared(numpy.zeros(param.get_value(borrow=True).shape, dtype=theano.config.floatX)) 
-                    gparams_mom.append(gparam_mom) 
-                
-                # Update the step direction using momentum 
-                updates = OrderedDict({})
-
-                for gparam_mom, gparam in zip(gparams_mom, gparams): 
-                    updates[gparam_mom] = momentum * gparam_mom + (1. - momentum) * gparam 
-
-                # ... and take a step along that direction 
-                for param, gparam_mom, rate in zip(self.params, gparams_mom, learn_rates): 
-                    stepped_param = param - (1. - momentum) * rate * gparam_mom 
-                    updates[param] = stepped_param 
-                safe_update(ups, updates) 
-            else: 
-                #Find the updates based on the parameters 
-                updates = [(p, p - step * gp) for (step, p, gp) in zip(learn_rates, self.params, gparams)] 
-                p_up = dict(updates) 
-                safe_update(ups, p_up)
-            return ups
-
-        def rmsprop2(cost, lr, rho=0.9, epsilon=1e-10): 
             # Return the dictionary of parameter specific learning rate updates 
             # using adagrad algorithm.
 
@@ -406,7 +346,7 @@ class DBN(object):
                 safe_update(ups, p_up)
             return ups
 
-        updates = rmsprop2(cost=train_cost, lr=learning_rate)
+        updates = rmsprop(cost=train_cost, lr=learning_rate)
 
         train_fn = theano.function(
             inputs=[index],
