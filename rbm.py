@@ -20,7 +20,6 @@ from theano.sandbox.rng_mrg import MRG_RandomStreams
 from logistic_sgd import load_data
 
 
-# start-snippet-1
 class RBM(object):
     """Restricted Boltzmann Machine (RBM)  """
     def __init__(
@@ -196,7 +195,6 @@ class RBM(object):
         return [pre_sigmoid_h1, h1_mean, h1_sample,
                 pre_sigmoid_v1, v1_mean, v1_sample]
 
-    # start-snippet-2
     def get_cost_updates(self, lr=0.1, persistent=None, k=1, momentum=0.9):
         """This functions implements one step of CD-k or PCD-k
 
@@ -225,7 +223,6 @@ class RBM(object):
             chain_start = ph_sample
         else:
             chain_start = persistent
-        # end-snippet-2
         # perform actual negative phase
         # in order to implement CD-k/PCD-k we need to scan over the
         # function that implements one gibbs step k times.
@@ -250,7 +247,6 @@ class RBM(object):
             outputs_info=[None, None, None, None, None, chain_start],
             n_steps=k
         )
-        # start-snippet-3
         # determine gradients on RBM parameters
         # note that we only need the sample at the end of the chain
         chain_end = nv_samples[-1]
@@ -312,9 +308,7 @@ class RBM(object):
                 safe_update(ups, p_up)
             return ups
 
-        updates = rmsprop(cost=rbm_cost, learning_rate=lr)
-
-        """
+        #updates = rmsprop(cost=rbm_cost, learning_rate=lr)
 
         # We must not compute the gradient through the gibbs sampling
         gparams = T.grad(rbm_cost, self.params, consider_constant=[chain_end])
@@ -337,7 +331,6 @@ class RBM(object):
             # since we have included learning_rate in gparam_mom, we don't need it
             # here
             updates[param] = param + updates[gparam_mom]
-        """
 
         if persistent:
             # Note that this works only if persistent is a shared variable
@@ -350,7 +343,6 @@ class RBM(object):
                                                            pre_sigmoid_nvs[-1])
 
         return monitoring_cost, updates
-        # end-snippet-4
 
     def get_pseudo_likelihood_cost(self, updates):
         """Stochastic approximation to the pseudo-likelihood"""
