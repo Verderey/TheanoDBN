@@ -240,7 +240,7 @@ class DBN(object):
             # get the cost and the updates list
             # using CD-k here (persisent=None) for training each RBM.
             # TODO: change cost function to reconstruction error
-            cost, updates = rbm.get_cost_updates(learning_rate,
+            cost, updates = rbm.get_cost_updates(lr=learning_rate,
                                                  persistent=None, k=k, momentum=momentum)
 
             # compile the theano function
@@ -257,7 +257,7 @@ class DBN(object):
 
         return pretrain_fns
 
-    def build_finetune_functions(self, datasets, batch_size, learning_rate, momentum):
+    def build_finetune_functions(self, datasets, batch_size, lr, momentum):
         '''Generates a function `train` that implements one step of
         finetuning, a function `validate` that computes the error on a
         batch from the validation set, and a function `test` that
@@ -294,7 +294,7 @@ class DBN(object):
             train_cost = self.negative_log_likelihood(self.y)
         errors = self.errors(self.y)
 
-        def rmsprop(cost, lr, rho=0.9, epsilon=1e-10): 
+        def rmsprop(cost, learning_rate, rho=0.9, epsilon=1e-10): 
             # Return the dictionary of parameter specific learning rate updates 
             # using adagrad algorithm.
 
@@ -321,13 +321,13 @@ class DBN(object):
                 acc = accumulators[param] 
                 ups[acc] = rho * acc + (1 - rho) * T.sqr(gp)
                 val = T.maximum(T.sqrt(T.sum(ups[acc])), epsilon)
-                learn_rates.append(lr / val)
+                learn_rates.append(T.cast(learning_rate, dtype=theano.config.floatX) / val)
 
             if momentum > 0: 
                 # ... and allocate mmeory for momentum'd versions of the gradient 
                 gparams_mom = [] 
                 for param in self.params: 
-                    gparam_mom = theano.shared(numpy.zeros(param.get_value(borrow=True).shape, dtype=theano.config.floatX)) 
+                    gparam_mom = theano.shared(numpy.zeros(param.get_value().shape, dtype=theano.config.floatX)) 
                     gparams_mom.append(gparam_mom) 
                 
                 # Update the step direction using momentum 
@@ -348,7 +348,32 @@ class DBN(object):
                 safe_update(ups, p_up)
             return ups
 
-        updates = rmsprop(cost=train_cost, lr=learning_rate)
+        def classicalMomentum(cost, learning_rate):
+            # We must not compute the gradient through the gibbs sampling
+            gparams = T.grad(cost, self.params)
+
+            # ... and allocate mmeory for momentum'd versions of the gradient
+            gparams_mom = []
+            for param in self.params:
+                gparam_mom = theano.shared(numpy.zeros(param.get_value().shape, dtype=theano.config.floatX))
+                gparams_mom.append(gparam_mom)
+
+            # Update the step direction using momentum
+            updates = OrderedDict()
+            for gparam_mom, gparam in zip(gparams_mom, gparams):
+                # change the update rule to match Hinton's dropout paper
+                updates[gparam_mom] = momentum * gparam_mom - (1. - momentum) * gparam * T.cast(learning_rate, dtype=theano.config.floatX)
+
+            # ... and take a step along that direction
+            for param, gparam_mom in zip(self.params, gparams_mom):
+                # since we have included learning_rate in gparam_mom, we don't need it
+                # here
+                updates[param] = param + updates[gparam_mom]
+
+            return updates
+
+        updates = rmsprop(cost=train_cost, learning_rate=lr)
+        #updates = classicalMomentum(cost=train_cost, learning_rate=lr)
 
         train_fn = theano.function(
             inputs=[index],
@@ -482,6 +507,7 @@ def test_DBN(finetune_lr=0.1, pretraining_epochs=200,
     print >> sys.stderr, ('The pretraining code for file ' +
                           os.path.split(__file__)[1] +
                           ' ran for %.2fm' % ((end_time - start_time) / 60.))
+                          
     ########################
     # FINETUNING THE MODEL #
     ########################
@@ -491,7 +517,7 @@ def test_DBN(finetune_lr=0.1, pretraining_epochs=200,
     train_fn, validate_model, test_model = dbn.build_finetune_functions(
         datasets=datasets,
         batch_size=batch_size,
-        learning_rate=finetune_lr,
+        lr=finetune_lr,
         momentum=finetune_mom
     )
 

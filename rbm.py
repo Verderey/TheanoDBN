@@ -275,13 +275,13 @@ class RBM(object):
                 eps_p = numpy.zeros_like(param.get_value()) 
                 accumulators[param] = theano.shared(value=numpy.cast[theano.config.floatX](eps_p), name="acc_%s" % param.name)
 
-            gparams = T.grad(cost, self.params)
+            gparams = T.grad(cost, self.params, consider_constant=[chain_end])
 
             for param, gp in zip(self.params, gparams): 
                 acc = accumulators[param] 
                 ups[acc] = rho * acc + (1 - rho) * T.sqr(gp)
                 val = T.maximum(T.sqrt(T.sum(ups[acc])), epsilon)
-                learn_rates.append(learning_rate / val)
+                learn_rates.append(T.cast(learning_rate, dtype=theano.config.floatX) / val)
 
             if momentum > 0: 
                 # ... and allocate mmeory for momentum'd versions of the gradient 
@@ -308,29 +308,32 @@ class RBM(object):
                 safe_update(ups, p_up)
             return ups
 
-        #updates = rmsprop(cost=rbm_cost, learning_rate=lr)
+        def classicalMomentum(cost, learning_rate):
+            # We must not compute the gradient through the gibbs sampling
+            gparams = T.grad(cost, self.params, consider_constant=[chain_end])
 
-        # We must not compute the gradient through the gibbs sampling
-        gparams = T.grad(rbm_cost, self.params, consider_constant=[chain_end])
-        # end-snippet-3 start-snippet-4
+            # ... and allocate mmeory for momentum'd versions of the gradient
+            gparams_mom = []
+            for param in self.params:
+                gparam_mom = theano.shared(numpy.zeros(param.get_value().shape, dtype=theano.config.floatX))
+                gparams_mom.append(gparam_mom)
 
-        # ... and allocate mmeory for momentum'd versions of the gradient
-        gparams_mom = []
-        for param in self.params:
-            gparam_mom = theano.shared(numpy.zeros(param.get_value().shape, dtype=theano.config.floatX))
-            gparams_mom.append(gparam_mom)
+            # Update the step direction using momentum
+            updates = OrderedDict()
+            for gparam_mom, gparam in zip(gparams_mom, gparams):
+                # change the update rule to match Hinton's dropout paper
+                updates[gparam_mom] = momentum * gparam_mom - (1. - momentum) * gparam * T.cast(learning_rate, dtype=theano.config.floatX)
 
-        # Update the step direction using momentum
-        updates = OrderedDict()
-        for gparam_mom, gparam in zip(gparams_mom, gparams):
-            # change the update rule to match Hinton's dropout paper
-            updates[gparam_mom] = momentum * gparam_mom - (1. - momentum) * gparam * T.cast(lr, dtype=theano.config.floatX)
+            # ... and take a step along that direction
+            for param, gparam_mom in zip(self.params, gparams_mom):
+                # since we have included learning_rate in gparam_mom, we don't need it
+                # here
+                updates[param] = param + updates[gparam_mom]
 
-        # ... and take a step along that direction
-        for param, gparam_mom in zip(self.params, gparams_mom):
-            # since we have included learning_rate in gparam_mom, we don't need it
-            # here
-            updates[param] = param + updates[gparam_mom]
+            return updates
+
+        updates = rmsprop(cost=rbm_cost, learning_rate=lr)
+        #updates = classicalMomentum(cost=rbm_cost, learning_rate=lr)
 
         if persistent:
             # Note that this works only if persistent is a shared variable
