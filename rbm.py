@@ -15,6 +15,7 @@ import theano
 import theano.tensor as T
 from theano.compat import six
 
+#from theano.tensor.shared_randomstreams import RandomStreams
 from theano.sandbox.rng_mrg import MRG_RandomStreams
 
 from logistic_sgd import load_data
@@ -31,7 +32,8 @@ class RBM(object):
         hbias=None,
         vbias=None,
         numpy_rng=None,
-        theano_rng=None
+        theano_rng=None,
+        rmsprop=False
     ):
         """
         RBM constructor. Defines the parameters of the model along with
@@ -59,6 +61,7 @@ class RBM(object):
 
         self.n_visible = n_visible
         self.n_hidden = n_hidden
+        self.rmsprop = rmsprop
 
         if numpy_rng is None:
             # create a number generator
@@ -195,7 +198,7 @@ class RBM(object):
         return [pre_sigmoid_h1, h1_mean, h1_sample,
                 pre_sigmoid_v1, v1_mean, v1_sample]
 
-    def get_cost_updates(self, lr=0.1, persistent=None, k=1, momentum=0.9):
+    def get_cost_updates(self, lr=0.1, persistent=None, k=1, mom=0.9):
         """This functions implements one step of CD-k or PCD-k
 
         :param lr: learning rate used to train the RBM
@@ -212,7 +215,7 @@ class RBM(object):
         chain, if one is used.
 
         """
-
+        momentum = T.cast(mom, dtype=theano.config.floatX)
         # compute positive phase
         pre_sigmoid_ph, ph_mean, ph_sample = self.sample_h_given_v(self.input)
 
@@ -254,59 +257,37 @@ class RBM(object):
         rbm_cost = T.mean(self.free_energy(self.input)) - T.mean(
             self.free_energy(chain_end))
 
-        def rmsprop(cost, learning_rate, rho=0.9, epsilon=1e-10): 
-            # Return the dictionary of parameter specific learning rate updates 
-            # using adagrad algorithm.
+        def rmsprop(cost, learning_rate, r=0.9, e=1e-2):
+            rho = T.cast(r, dtype=theano.config.floatX)
+            epsilon = T.cast(e, dtype=theano.config.floatX)
+            rFactor = T.cast(1.0, dtype=theano.config.floatX) - rho
+            lrFactor = T.cast(1.0, dtype=theano.config.floatX) - momentum
 
-            def safe_update(dict_to, dict_from):
-                # Like dict_to.update(dict_from), except don't overwrite any keys.
-                for key, val in six.iteritems(dict_from):
-                    if key in dict_to:
-                        raise KeyError(key)
-                    dict_to[key] = val
-                return dict_to
+            updates = []
+            oldUpdates = []
+            oldMeanSquares = []
+            for param in self.params:
+                oldUpdate = theano.shared(numpy.zeros(param.get_value().shape, dtype=theano.config.floatX))
+                oldMeanSquare = theano.shared(numpy.zeros(param.get_value().shape, dtype=theano.config.floatX))
+                oldUpdates.append(oldUpdate)
+                oldMeanSquares.append(oldMeanSquare)
 
-            #Initialize the variables 
-            accumulators = OrderedDict({})
-            learn_rates = [] 
-            ups = OrderedDict({})
-            #initialize the accumulator and the epsilon_0 
-            for param in self.params: 
-                eps_p = numpy.zeros_like(param.get_value()) 
-                accumulators[param] = theano.shared(value=numpy.cast[theano.config.floatX](eps_p), name="acc_%s" % param.name)
+            deltaParams = T.grad(cost, self.params, consider_constant=[chain_end])
+            parametersTuples = zip(self.params,
+                                deltaParams,
+                                oldUpdates,
+                                oldMeanSquares)
 
-            gparams = T.grad(cost, self.params, consider_constant=[chain_end])
+            for param, delta, oldUpdate, oldMeanSquare in parametersTuples:
+                paramUpdate = momentum * oldUpdate
+                meanSquare = rho * oldMeanSquare + rFactor * T.sqr(delta)
+                paramUpdate += - lrFactor * learning_rate * delta / T.maximum(T.sqrt(meanSquare), epsilon)
+                updates.append((oldMeanSquare, meanSquare))
+                newParam = param + paramUpdate
+                updates.append((param, newParam))
+                updates.append((oldUpdate, paramUpdate))
 
-            for param, gp in zip(self.params, gparams): 
-                acc = accumulators[param] 
-                ups[acc] = rho * acc + (1 - rho) * T.sqr(gp)
-                val = T.maximum(T.sqrt(T.sum(ups[acc])), epsilon)
-                learn_rates.append(T.cast(learning_rate, dtype=theano.config.floatX) / val)
-
-            if momentum > 0: 
-                # ... and allocate mmeory for momentum'd versions of the gradient 
-                gparams_mom = [] 
-                for param in self.params: 
-                    gparam_mom = theano.shared(numpy.zeros(param.get_value(borrow=True).shape, dtype=theano.config.floatX)) 
-                    gparams_mom.append(gparam_mom) 
-                
-                # Update the step direction using momentum 
-                updates = OrderedDict({})
-
-                for gparam_mom, gparam in zip(gparams_mom, gparams): 
-                    updates[gparam_mom] = momentum * gparam_mom + (1. - momentum) * gparam 
-
-                # ... and take a step along that direction 
-                for param, gparam_mom, rate in zip(self.params, gparams_mom, learn_rates): 
-                    stepped_param = param - (1. - momentum) * rate * gparam_mom 
-                    updates[param] = stepped_param 
-                safe_update(ups, updates) 
-            else: 
-                #Find the updates based on the parameters 
-                updates = [(p, p - step * gp) for (step, p, gp) in zip(learn_rates, self.params, gparams)] 
-                p_up = dict(updates) 
-                safe_update(ups, p_up)
-            return ups
+            return updates
 
         def classicalMomentum(cost, learning_rate):
             # We must not compute the gradient through the gibbs sampling
@@ -322,7 +303,7 @@ class RBM(object):
             updates = OrderedDict()
             for gparam_mom, gparam in zip(gparams_mom, gparams):
                 # change the update rule to match Hinton's dropout paper
-                updates[gparam_mom] = momentum * gparam_mom - (1. - momentum) * gparam * T.cast(learning_rate, dtype=theano.config.floatX)
+                updates[gparam_mom] = momentum * gparam_mom - (1. - momentum) * gparam * learning_rate
 
             # ... and take a step along that direction
             for param, gparam_mom in zip(self.params, gparams_mom):
@@ -332,8 +313,10 @@ class RBM(object):
 
             return updates
 
-        updates = rmsprop(cost=rbm_cost, learning_rate=lr)
-        #updates = classicalMomentum(cost=rbm_cost, learning_rate=lr)
+        if self.rmsprop:
+            updates = rmsprop(cost=rbm_cost, learning_rate=T.cast(lr, dtype=theano.config.floatX))
+        else:
+            updates = classicalMomentum(cost=rbm_cost, learning_rate=T.cast(lr, dtype=theano.config.floatX))
 
         if persistent:
             # Note that this works only if persistent is a shared variable
@@ -420,3 +403,38 @@ class RBM(object):
         cost = T.sum(T.sqr(self.input - T.nnet.sigmoid(pre_sigmoid_nv)))
 
         return cost
+
+
+
+class DropoutRBM(RBM):
+
+    # --------------------------------------------------------------------------
+    # initialize class
+    def __init__(self, input=None, n_visible=784, n_hidden=500, 
+                W=None, hbias=None, vbias=None, numpy_rng=None, 
+                theano_rng=None, rmsprop=True, hiddenDropout=1.0):
+
+        # initialize parent class (RBM)
+        RBM.__init__(self, input=input, n_visible=n_visible, n_hidden=n_hidden,
+                    W=W, hbias=hbias, vbias=vbias, numpy_rng=numpy_rng, 
+                    theano_rng=theano_rng, rmsprop=rmsprop)
+
+        self.hiddenDropout = hiddenDropout
+        self.weightScale = T.cast(1.0, dtype=theano.config.floatX) / T.cast(hiddenDropout, dtype=theano.config.floatX)
+
+    def sample_h_given_v(self, v0_sample):
+        ''' This function infers state of hidden units given visible units '''
+        pre_sigmoid_h1, h1_mean = self.propup(v0_sample)
+        h1_sample = self.theano_rng.binomial(size=h1_mean.shape,
+                                             n=1, p=h1_mean,
+                                             dtype=theano.config.floatX)
+        drop_mask = self.theano_rng.binomial(n=1, p=self.hiddenDropout, size=h1_mean.shape)
+        h1_mean = h1_mean * T.cast(drop_mask, theano.config.floatX)
+        h1_sample = h1_sample * T.cast(drop_mask, theano.config.floatX)
+        return [pre_sigmoid_h1, h1_mean, h1_sample]
+
+    def propdown(self, hid):
+        '''This function propagates the hidden units activation downwards to
+        the visible units '''
+        pre_sigmoid_activation = self.weightScale * T.dot(hid, self.W.T) + self.vbias
+        return [pre_sigmoid_activation, T.nnet.sigmoid(pre_sigmoid_activation)]

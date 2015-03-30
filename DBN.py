@@ -9,7 +9,7 @@ import os
 import sys
 import time
 from collections import OrderedDict
-import cudamat as cm
+#import cudamat as cm
 
 import numpy
 
@@ -20,7 +20,7 @@ from theano.sandbox.rng_mrg import MRG_RandomStreams
 
 from logistic_sgd import LogisticRegression, load_data
 from mlp import HiddenLayer, DropoutHiddenLayer, _dropout_from_layer
-from rbm import RBM
+from rbm import RBM, DropoutRBM
 
 
 class DBN(object):
@@ -133,15 +133,17 @@ class DBN(object):
                 self.sigmoid_layers.append(sigmoid_layer)
 
                 # Construct an RBM that shared weights with this layer
-                rbm_layer = RBM(numpy_rng=numpy_rng,
+                rbm_layer = DropoutRBM(numpy_rng=numpy_rng,
                                 theano_rng=theano_rng,
                                 input=layer_input,
                                 n_visible=input_size,
                                 n_hidden=hidden_layers_sizes[i],
                                 W=next_dropout_layer.W,
-                                hbias=next_dropout_layer.b)
+                                hbias=next_dropout_layer.b,
+                                hiddenDropout=0.5,
+                                rmsprop=True)
+
                 self.rbm_layers.append(rbm_layer)
-                ### END ###
             else:
                 ### NO DROPOUT VERSION
                 sigmoid_layer = HiddenLayer(rng=numpy_rng,
@@ -241,7 +243,7 @@ class DBN(object):
             # using CD-k here (persisent=None) for training each RBM.
             # TODO: change cost function to reconstruction error
             cost, updates = rbm.get_cost_updates(lr=learning_rate,
-                                                 persistent=None, k=k, momentum=momentum)
+                                                 persistent=None, k=k, mom=momentum)
 
             # compile the theano function
             fn = theano.function(
@@ -257,7 +259,7 @@ class DBN(object):
 
         return pretrain_fns
 
-    def build_finetune_functions(self, datasets, batch_size, lr, momentum):
+    def build_finetune_functions(self, datasets, batch_size, lr, mom):
         '''Generates a function `train` that implements one step of
         finetuning, a function `validate` that computes the error on a
         batch from the validation set, and a function `test` that
@@ -275,6 +277,7 @@ class DBN(object):
         :param learning_rate: learning rate used during finetune stage
 
         '''
+        momentum = T.cast(mom, dtype=theano.config.floatX)
 
         (train_set_x, train_set_y) = datasets[0]
         (valid_set_x, valid_set_y) = datasets[1]
@@ -294,59 +297,39 @@ class DBN(object):
             train_cost = self.negative_log_likelihood(self.y)
         errors = self.errors(self.y)
 
-        def rmsprop(cost, learning_rate, rho=0.9, epsilon=1e-10): 
-            # Return the dictionary of parameter specific learning rate updates 
-            # using adagrad algorithm.
+        def rmsprop(cost, learning_rate, r=0.9, e=1e-2):
+            rho = T.cast(r, dtype=theano.config.floatX)
+            epsilon = T.cast(e, dtype=theano.config.floatX)
+            rFactor = T.cast(1.0, dtype=theano.config.floatX) - rho
+            lrFactor = T.cast(1.0, dtype=theano.config.floatX) - momentum
 
-            def safe_update(dict_to, dict_from):
-                # Like dict_to.update(dict_from), except don't overwrite any keys.
-                for key, val in six.iteritems(dict_from):
-                    if key in dict_to:
-                        raise KeyError(key)
-                    dict_to[key] = val
-                return dict_to
+            updates = []
+            oldUpdates = []
+            oldMeanSquares = []
+            for param in self.params:
+                oldUpdate = theano.shared(numpy.zeros(param.get_value().shape, dtype=theano.config.floatX))
+                oldMeanSquare = theano.shared(numpy.zeros(param.get_value().shape, dtype=theano.config.floatX))
+                oldUpdates.append(oldUpdate)
+                oldMeanSquares.append(oldMeanSquare)
 
-            #Initialize the variables 
-            accumulators = OrderedDict({})
-            learn_rates = [] 
-            ups = OrderedDict({})
-            #initialize the accumulator and the epsilon_0 
-            for param in self.params: 
-                eps_p = numpy.zeros_like(param.get_value()) 
-                accumulators[param] = theano.shared(value=numpy.cast[theano.config.floatX](eps_p), name="acc_%s" % param.name)
+            deltaParams = T.grad(cost, self.params)
+            parametersTuples = zip(self.params,
+                                deltaParams,
+                                oldUpdates,
+                                oldMeanSquares)
 
-            gparams = T.grad(cost, self.params)
+            for param, delta, oldUpdate, oldMeanSquare in parametersTuples:
+                paramUpdate = momentum * oldUpdate
+                #meanSquare = rho * oldMeanSquare + (1 - rho) * delta ** 2
+                meanSquare = rho * oldMeanSquare + rFactor * T.sqr(delta)
+                #paramUpdate += - lrFactor * learning_rate * delta / T.sqrt(meanSquare + epsilon)
+                paramUpdate += - lrFactor * learning_rate * delta / T.maximum(T.sqrt(meanSquare), epsilon)
+                updates.append((oldMeanSquare, meanSquare))
+                newParam = param + paramUpdate
+                updates.append((param, newParam))
+                updates.append((oldUpdate, paramUpdate))
 
-            for param, gp in zip(self.params, gparams): 
-                acc = accumulators[param] 
-                ups[acc] = rho * acc + (1 - rho) * T.sqr(gp)
-                val = T.maximum(T.sqrt(T.sum(ups[acc])), epsilon)
-                learn_rates.append(T.cast(learning_rate, dtype=theano.config.floatX) / val)
-
-            if momentum > 0: 
-                # ... and allocate mmeory for momentum'd versions of the gradient 
-                gparams_mom = [] 
-                for param in self.params: 
-                    gparam_mom = theano.shared(numpy.zeros(param.get_value().shape, dtype=theano.config.floatX)) 
-                    gparams_mom.append(gparam_mom) 
-                
-                # Update the step direction using momentum 
-                updates = OrderedDict({})
-
-                for gparam_mom, gparam in zip(gparams_mom, gparams): 
-                    updates[gparam_mom] = momentum * gparam_mom + (1. - momentum) * gparam 
-
-                # ... and take a step along that direction 
-                for param, gparam_mom, rate in zip(self.params, gparams_mom, learn_rates): 
-                    stepped_param = param - (1. - momentum) * rate * gparam_mom 
-                    updates[param] = stepped_param 
-                safe_update(ups, updates) 
-            else: 
-                #Find the updates based on the parameters 
-                updates = [(p, p - step * gp) for (step, p, gp) in zip(learn_rates, self.params, gparams)] 
-                p_up = dict(updates) 
-                safe_update(ups, p_up)
-            return ups
+            return updates
 
         def classicalMomentum(cost, learning_rate):
             # We must not compute the gradient through the gibbs sampling
@@ -362,7 +345,7 @@ class DBN(object):
             updates = OrderedDict()
             for gparam_mom, gparam in zip(gparams_mom, gparams):
                 # change the update rule to match Hinton's dropout paper
-                updates[gparam_mom] = momentum * gparam_mom - (1. - momentum) * gparam * T.cast(learning_rate, dtype=theano.config.floatX)
+                updates[gparam_mom] = momentum * gparam_mom - (1. - momentum) * gparam * learning_rate
 
             # ... and take a step along that direction
             for param, gparam_mom in zip(self.params, gparams_mom):
@@ -372,8 +355,8 @@ class DBN(object):
 
             return updates
 
-        updates = rmsprop(cost=train_cost, learning_rate=lr)
-        #updates = classicalMomentum(cost=train_cost, learning_rate=lr)
+        updates = rmsprop(cost=train_cost, learning_rate=T.cast(lr, dtype=theano.config.floatX))
+        #updates = classicalMomentum(cost=train_cost, T.cast(learning_rate=lr, dtype=theano.config.floatX))
 
         train_fn = theano.function(
             inputs=[index],
@@ -431,9 +414,27 @@ def print_meminfo():
     print ("Current device memory allocated: %.3f of %.3f GB" 
             % (allocated / 1024.0 ** 3, total_mem / 1024.0 ** 3))
 
+def visualize_features(rbm_weights):
+    """ visualize the first 64 filters of a given RBM
+
+    NOTE: The number of visible units must a value with an
+    integer-valued square root, and the number of hidden units
+    must be at least 64 """
+
+    import matplotlib.pylab as plt
+    n_inputs = rbm_weights.shape[0]
+    image_size = int(np.sqrt(n_inputs))
+
+    for i in range(64):
+        feature = np.reshape(rbm_weights[:,i],(image_size,image_size))
+        plt.subplot(10,10,i)
+        plt.imshow(feature)
+
+    plt.show()
+
 
 def test_DBN(finetune_lr=0.1, pretraining_epochs=200, 
-             pretrain_lr=0.003, k=1, training_epochs=1000,
+             pretrain_lrs=[0.002, 0.005], k=1, training_epochs=1800,
              pretrain_mom=0.95, finetune_mom=0.8,
              dataset='/mnt/Drive2/reuben/mnist/data/mnist.pkl.gz', batch_size=128):
     """
@@ -457,7 +458,8 @@ def test_DBN(finetune_lr=0.1, pretraining_epochs=200,
     :param batch_size: the size of a minibatch
     """
 
-    print_meminfo()
+    #print_meminfo()
+    #dataset = '/Users/reuben_feinman/Data/mnist/mnist.pkl.gz'
     datasets = load_data(dataset)
 
     train_set_x, train_set_y = datasets[0]
@@ -475,8 +477,8 @@ def test_DBN(finetune_lr=0.1, pretraining_epochs=200,
     # construct the Deep Belief Network
 
     dbn = DBN(numpy_rng=numpy_rng, n_ins=28 * 28,
-              hidden_layers_sizes=[800,800],
-              dropout_rates=[0.8, 0.7, 0.7],
+              hidden_layers_sizes=[800, 800],
+              dropout_rates=[0.8, 0.5, 0.5],
               n_outs=10)
 
     #########################
@@ -492,9 +494,10 @@ def test_DBN(finetune_lr=0.1, pretraining_epochs=200,
     ## Pre-train layer-wise
     for i in xrange(dbn.n_layers):
         # go through pretraining epochs
+        pretrain_lr = pretrain_lrs[i]
         for epoch in xrange(pretraining_epochs):
-            if epoch % 20 == 0:
-                print_meminfo()
+            #if epoch % 20 == 0:
+                #print_meminfo()
             # go through the training set
             c = []
             time0 = time.time()
@@ -507,7 +510,15 @@ def test_DBN(finetune_lr=0.1, pretraining_epochs=200,
     print >> sys.stderr, ('The pretraining code for file ' +
                           os.path.split(__file__)[1] +
                           ' ran for %.2fm' % ((end_time - start_time) / 60.))
-                          
+
+    weights0 = dbn.rbm_layers[0].W.get_value()
+    weights1 = dbn.rbm_layers[1].W.get_value()
+    numpy.save('/home/reuben/features/weights0.npy',weights0)
+    numpy.save('/home/reuben/features/weights1.npy',weights1)
+    #numpy.save('/Users/reuben_feinman/Data/features/weights0.npy',weights0)
+    #numpy.save('/Users/reuben_feinman/Data/features/weights1.npy',weights1)
+
+
     ########################
     # FINETUNING THE MODEL #
     ########################
@@ -518,7 +529,7 @@ def test_DBN(finetune_lr=0.1, pretraining_epochs=200,
         datasets=datasets,
         batch_size=batch_size,
         lr=finetune_lr,
-        momentum=finetune_mom
+        mom=finetune_mom
     )
 
     print '... finetuning the model'
@@ -544,7 +555,7 @@ def test_DBN(finetune_lr=0.1, pretraining_epochs=200,
 
     while (epoch < training_epochs):# and (not done_looping):
         if epoch % 20 == 10:
-            print_meminfo()
+            #print_meminfo()
             print "current best test error: ", float(best_test_error_sum)/n_test_samples, ", achieved at epoch ", best_epoch
         epoch = epoch + 1
         time0 = time.time()
