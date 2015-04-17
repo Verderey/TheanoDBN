@@ -9,18 +9,16 @@ import os
 import sys
 import time
 from collections import OrderedDict
-#import cudamat as cm
 
 import numpy
 
 import theano
 import theano.tensor as T
-from theano.compat import six
 from theano.sandbox.rng_mrg import MRG_RandomStreams
 
 from logistic_sgd import LogisticRegression, load_data
 from mlp import HiddenLayer, DropoutHiddenLayer, _dropout_from_layer
-from rbm import RBM, DropoutRBM
+from rbm import RBM, GBRBM, DropoutRBM
 
 
 class DBN(object):
@@ -34,9 +32,8 @@ class DBN(object):
     regression layer on top.
     """
 
-    def __init__(self, numpy_rng, theano_rng=None, n_ins=784,
-                 hidden_layers_sizes=[500, 500], n_outs=10,
-                 dropout_rates=None):
+    def __init__(self, numpy_rng, hidden_layers_sizes, dropout_rates, 
+                theano_rng=None, n_ins=784, n_outs=10, rmsprop=True):
         """This class is made to support a variable number of layers.
 
         :type numpy_rng: numpy.random.RandomState
@@ -58,6 +55,8 @@ class DBN(object):
         :param n_outs: dimension of the output of the network
         """
 
+        self.dropout = any([rate not in [1.0, 1] for rate in dropout_rates])
+        self.rmsprop = rmsprop
         self.sigmoid_layers = []
         self.dropout_layers = []
         self.rbm_layers = []
@@ -104,112 +103,82 @@ class DBN(object):
             # the first layer
             if i == 0:
                 layer_input = self.x
-                if self.dropout:
-                    next_dropout_layer_input = _dropout_from_layer(numpy_rng, layer_input, dropout_rates[0])
+                next_dropout_layer_input = _dropout_from_layer(numpy_rng, layer_input, dropout_rates[0])
             else:
                 layer_input = self.sigmoid_layers[-1].output
-                if self.dropout:
-                    next_dropout_layer_input = self.dropout_layers[-1].output
-            if self.dropout:
-                ### DROPOUT VERSION ###
-                next_dropout_layer = DropoutHiddenLayer(rng=numpy_rng,
-                                            input=next_dropout_layer_input,
-                                            activation=T.nnet.sigmoid,
-                                            n_in=input_size, 
-                                            n_out=hidden_layers_sizes[i],
-                                            dropout_rate=dropout_rates[i+1])
-                self.dropout_layers.append(next_dropout_layer)
+                next_dropout_layer_input = self.dropout_layers[-1].output
+
+            next_dropout_layer = DropoutHiddenLayer(rng=numpy_rng,
+                                        input=next_dropout_layer_input,
+                                        activation=T.nnet.sigmoid,
+                                        n_in=input_size, 
+                                        n_out=hidden_layers_sizes[i],
+                                        dropout_rate=dropout_rates[i+1])
+            self.dropout_layers.append(next_dropout_layer)
 
 
-                sigmoid_layer = HiddenLayer(rng=numpy_rng,
-                                            input=layer_input,
-                                            n_in=input_size,
-                                            n_out=hidden_layers_sizes[i],
-                                            activation=T.nnet.sigmoid,
-                                            W=next_dropout_layer.W * dropout_rates[i],
-                                            b=next_dropout_layer.b)
+            sigmoid_layer = HiddenLayer(rng=numpy_rng,
+                                        input=layer_input,
+                                        n_in=input_size,
+                                        n_out=hidden_layers_sizes[i],
+                                        activation=T.nnet.sigmoid,
+                                        W=next_dropout_layer.W * dropout_rates[i],
+                                        b=next_dropout_layer.b)
 
-                # add the layer to our list of layers
-                self.sigmoid_layers.append(sigmoid_layer)
+            # add the layer to our list of layers
+            self.sigmoid_layers.append(sigmoid_layer)
 
-                # Construct an RBM that shared weights with this layer
-                rbm_layer = DropoutRBM(numpy_rng=numpy_rng,
+            # Construct an RBM that shared weights with this layer
+            if i == 0:
+                rbm_layer = RBM(numpy_rng=numpy_rng,
                                 theano_rng=theano_rng,
                                 input=layer_input,
                                 n_visible=input_size,
                                 n_hidden=hidden_layers_sizes[i],
                                 W=next_dropout_layer.W,
                                 hbias=next_dropout_layer.b,
-                                hiddenDropout=0.5,
                                 rmsprop=True)
-
-                self.rbm_layers.append(rbm_layer)
-            else:
-                ### NO DROPOUT VERSION
-                sigmoid_layer = HiddenLayer(rng=numpy_rng,
-                                            input=layer_input,
-                                            n_in=input_size,
-                                            n_out=hidden_layers_sizes[i],
-                                            activation=T.nnet.sigmoid)
-
-                # add the layer to our list of layers
-                self.sigmoid_layers.append(sigmoid_layer)
-
-                # Construct an RBM that shared weights with this layer
+            else:  
                 rbm_layer = RBM(numpy_rng=numpy_rng,
                                 theano_rng=theano_rng,
                                 input=layer_input,
                                 n_visible=input_size,
                                 n_hidden=hidden_layers_sizes[i],
-                                W=sigmoid_layer.W,
-                                hbias=sigmoid_layer.b)
-                self.rbm_layers.append(rbm_layer)
-                ### END ###
-        if self.dropout:
-            ### DROPOUT VERSION ###
-            dropoutLogLayer = LogisticRegression(
-                input=self.dropout_layers[-1].output,
-                n_in=hidden_layers_sizes[-1],
-                n_out=n_outs)
-            self.dropout_layers.append(dropoutLogLayer)
+                                W=next_dropout_layer.W,
+                                hbias=next_dropout_layer.b,
+                                rmsprop=True)
 
-            # We now need to add a logistic layer on top of the MLP
-            logLayer = LogisticRegression(
-                input=self.sigmoid_layers[-1].output,
-                n_in=hidden_layers_sizes[-1],
-                n_out=n_outs,
-                W=dropoutLogLayer.W * dropout_rates[-1],
-                b=dropoutLogLayer.b)
-            self.sigmoid_layers.append(logLayer)
+            self.rbm_layers.append(rbm_layer)
 
-            # compute the cost for second phase of training, defined as the
-            # negative log likelihood of the logistic regression (output) layer
-            self.dropout_negative_log_likelihood = self.dropout_layers[-1].negative_log_likelihood
-            self.dropout_errors=self.dropout_layers[-1].errors
+        # Output layer
+        dropoutLogLayer = LogisticRegression(
+            input=self.dropout_layers[-1].output,
+            n_in=hidden_layers_sizes[-1],
+            n_out=n_outs)
+        self.dropout_layers.append(dropoutLogLayer)
 
-            self.negative_log_likelihood = self.sigmoid_layers[-1].negative_log_likelihood
-            self.errors = self.sigmoid_layers[-1].errors
+        # We now need to add a logistic layer on top of the MLP
+        logLayer = LogisticRegression(
+            input=self.sigmoid_layers[-1].output,
+            n_in=hidden_layers_sizes[-1],
+            n_out=n_outs,
+            W=dropoutLogLayer.W * dropout_rates[-1],
+            b=dropoutLogLayer.b)
+        self.sigmoid_layers.append(logLayer)
 
-            # Grab all the parameters for dropout_layers together.
-            self.params = [ param for layer in self.dropout_layers for param in layer.params ]
-            ### END ###
-        else:
-            ### NO DROPOUT VERSION ###
-            # We now need to add a logistic layer on top of the MLP
-            logLayer = LogisticRegression(
-                input=self.sigmoid_layers[-1].output,
-                n_in=hidden_layers_sizes[-1],
-                n_out=n_outs)
-            self.sigmoid_layers.append(logLayer)
+        # compute the cost for second phase of training, defined as the
+        # negative log likelihood of the logistic regression (output) layer
+        self.dropout_negative_log_likelihood = self.dropout_layers[-1].negative_log_likelihood
+        self.dropout_errors=self.dropout_layers[-1].errors
 
-            self.negative_log_likelihood = self.sigmoid_layers[-1].negative_log_likelihood
-            self.errors = self.sigmoid_layers[-1].errors
+        self.negative_log_likelihood = self.sigmoid_layers[-1].negative_log_likelihood
+        self.errors = self.sigmoid_layers[-1].errors
 
-            self.params = [ param for layer in self.sigmoid_layers for param in layer.params ]
-            ### END ###
+        # Grab all the parameters for dropout_layers together.
+        self.params = [ param for layer in self.dropout_layers for param in layer.params ]
 
 
-    def pretraining_functions(self, train_set_x, batch_size, k, momentum):
+    def pretraining_functions(self, train_set_x, batch_size, k):
         '''Generates a list of functions, for performing one step of
         gradient descent at a given layer. The function will require
         as input the minibatch index, and to train an RBM you just
@@ -228,6 +197,7 @@ class DBN(object):
         # index to a [mini]batch
         index = T.lscalar('index')  # index to a minibatch
         learning_rate = T.scalar('lr')  # learning rate to use
+        momentum = T.scalar('momentum')
 
         # number of batches
         n_batches = train_set_x.get_value().shape[0] / batch_size
@@ -247,7 +217,7 @@ class DBN(object):
 
             # compile the theano function
             fn = theano.function(
-                inputs=[index, theano.Param(learning_rate, default=0.1)],
+                inputs=[index, theano.Param(learning_rate, default=0.1), theano.Param(momentum, default=0.005)],
                 outputs=cost,
                 updates=updates,
                 givens={
@@ -297,11 +267,8 @@ class DBN(object):
             train_cost = self.negative_log_likelihood(self.y)
         errors = self.errors(self.y)
 
-        def rmsprop(cost, learning_rate, r=0.9, e=1e-2):
+        def rmsprop(cost, learning_rate, r=0.9, epsilon=1e-2):
             rho = T.cast(r, dtype=theano.config.floatX)
-            epsilon = T.cast(e, dtype=theano.config.floatX)
-            rFactor = T.cast(1.0, dtype=theano.config.floatX) - rho
-            lrFactor = T.cast(1.0, dtype=theano.config.floatX) - momentum
 
             updates = []
             oldUpdates = []
@@ -320,10 +287,8 @@ class DBN(object):
 
             for param, delta, oldUpdate, oldMeanSquare in parametersTuples:
                 paramUpdate = momentum * oldUpdate
-                #meanSquare = rho * oldMeanSquare + (1 - rho) * delta ** 2
-                meanSquare = rho * oldMeanSquare + rFactor * T.sqr(delta)
-                #paramUpdate += - lrFactor * learning_rate * delta / T.sqrt(meanSquare + epsilon)
-                paramUpdate += - lrFactor * learning_rate * delta / T.maximum(T.sqrt(meanSquare), epsilon)
+                meanSquare = rho * oldMeanSquare + (1. - rho) * T.sqr(delta)
+                paramUpdate += - (1. - momentum) * learning_rate * delta / T.maximum(T.sqrt(meanSquare), epsilon)
                 updates.append((oldMeanSquare, meanSquare))
                 newParam = param + paramUpdate
                 updates.append((param, newParam))
@@ -355,8 +320,10 @@ class DBN(object):
 
             return updates
 
-        updates = rmsprop(cost=train_cost, learning_rate=T.cast(lr, dtype=theano.config.floatX))
-        #updates = classicalMomentum(cost=train_cost, T.cast(learning_rate=lr, dtype=theano.config.floatX))
+        if self.rmsprop:
+            updates = rmsprop(cost=train_cost, learning_rate=T.cast(lr, dtype=theano.config.floatX))
+        else:
+            updates = classicalMomentum(cost=train_cost, learning_rate=T.cast(lr, dtype=theano.config.floatX))
 
         train_fn = theano.function(
             inputs=[index],
@@ -398,6 +365,19 @@ class DBN(object):
             }
         )
 
+        test_initial_i = theano.function(
+            inputs=[index],
+            outputs=self.negative_log_likelihood(self.y),
+            givens={
+                self.x: test_set_x[
+                    index * batch_size: (index + 1) * batch_size
+                ],
+                self.y: test_set_y[
+                    index * batch_size: (index + 1) * batch_size
+                ]
+            }
+        )
+
         # Create a function that scans the entire validation set
         def valid_score():
             return [valid_score_i(i) for i in xrange(n_valid_batches)]
@@ -408,11 +388,6 @@ class DBN(object):
 
         return train_fn, valid_score, test_score
 
-def print_meminfo():
-    avail_mem, total_mem = cm.get_mem_info()
-    allocated = total_mem - avail_mem
-    print ("Current device memory allocated: %.3f of %.3f GB" 
-            % (allocated / 1024.0 ** 3, total_mem / 1024.0 ** 3))
 
 def visualize_features(rbm_weights):
     """ visualize the first 64 filters of a given RBM
@@ -423,10 +398,10 @@ def visualize_features(rbm_weights):
 
     import matplotlib.pylab as plt
     n_inputs = rbm_weights.shape[0]
-    image_size = int(np.sqrt(n_inputs))
+    image_size = int(numpy.sqrt(n_inputs))
 
     for i in range(64):
-        feature = np.reshape(rbm_weights[:,i],(image_size,image_size))
+        feature = numpy.reshape(rbm_weights[:,i],(image_size,image_size))
         plt.subplot(10,10,i)
         plt.imshow(feature)
 
@@ -434,9 +409,11 @@ def visualize_features(rbm_weights):
 
 
 def test_DBN(finetune_lr=0.1, pretraining_epochs=200, 
-             pretrain_lrs=[0.002, 0.005], k=1, training_epochs=1800,
-             pretrain_mom=0.95, finetune_mom=0.8,
+             pretrain_lrs=[0.005, 0.005], k=1, training_epochs=1800,
+             hidden_layers_sizes=[800, 800], dropout_rates=[0.8, 0.5, 0.5], 
+             pretrain_moms=[0.95, 0.95], finetune_mom=0.8,
              dataset='/mnt/Drive2/reuben/mnist/data/mnist.pkl.gz', batch_size=128):
+
     """
     Demonstrates how to train and test a Deep Belief Network.
 
@@ -458,8 +435,8 @@ def test_DBN(finetune_lr=0.1, pretraining_epochs=200,
     :param batch_size: the size of a minibatch
     """
 
-    #print_meminfo()
-    #dataset = '/Users/reuben_feinman/Data/mnist/mnist.pkl.gz'
+    #dataset = '/Users/reuben_feinman/Data/mnist/mnist.pkl.gz' # local macbook
+    #dataset='/home/rfeinman/data/mnist.pkl.gz' # ibil server
     datasets = load_data(dataset)
 
     train_set_x, train_set_y = datasets[0]
@@ -477,8 +454,8 @@ def test_DBN(finetune_lr=0.1, pretraining_epochs=200,
     # construct the Deep Belief Network
 
     dbn = DBN(numpy_rng=numpy_rng, n_ins=28 * 28,
-              hidden_layers_sizes=[800, 800],
-              dropout_rates=[0.8, 0.5, 0.5],
+              hidden_layers_sizes=hidden_layers_sizes,
+              dropout_rates=dropout_rates,
               n_outs=10)
 
     #########################
@@ -487,48 +464,46 @@ def test_DBN(finetune_lr=0.1, pretraining_epochs=200,
     print '... getting the pretraining functions'
     pretraining_fns = dbn.pretraining_functions(train_set_x=train_set_x,
                                                 batch_size=batch_size,
-                                                k=k, momentum=pretrain_mom)
+                                                k=k)
 
     print '... pre-training the model'
     start_time = time.clock()
     ## Pre-train layer-wise
     for i in xrange(dbn.n_layers):
         # go through pretraining epochs
-        pretrain_lr = pretrain_lrs[i]
         for epoch in xrange(pretraining_epochs):
-            #if epoch % 20 == 0:
-                #print_meminfo()
             # go through the training set
             c = []
             time0 = time.time()
             for batch_index in xrange(n_train_batches):
-                c.append(pretraining_fns[i](index=batch_index, lr=pretrain_lr))
-            total_cost = numpy.sum(c)
+                c.append(pretraining_fns[i](index=batch_index, lr=pretrain_lrs[i], momentum=pretrain_moms[i]))
+            total_cost = numpy.mean(c)
             print 'Pre-training layer %i, secs %f, epoch %d, cost ' % (i, time.time() - time0, epoch), total_cost
 
     end_time = time.clock()
     print >> sys.stderr, ('The pretraining code for file ' +
                           os.path.split(__file__)[1] +
                           ' ran for %.2fm' % ((end_time - start_time) / 60.))
-
+    """
+    # visually examin features
     weights0 = dbn.rbm_layers[0].W.get_value()
-    weights1 = dbn.rbm_layers[1].W.get_value()
-    numpy.save('/home/reuben/features/weights0.npy',weights0)
-    numpy.save('/home/reuben/features/weights1.npy',weights1)
-    #numpy.save('/Users/reuben_feinman/Data/features/weights0.npy',weights0)
-    #numpy.save('/Users/reuben_feinman/Data/features/weights1.npy',weights1)
-
+    visualize_features(weights0)
+    """
 
     ########################
     # FINETUNING THE MODEL #
     ########################
 
+    learning_rate = theano.shared(value=numpy.asarray(finetune_lr, dtype=theano.config.floatX),
+                                name='learning_rate',borrow=True)
+    decay_learning_rate = theano.function(inputs=[], outputs=[],
+                                        updates={learning_rate: learning_rate * 0.998})
     # get the training, validation and testing function for the model
     print '... getting the finetuning functions'
     train_fn, validate_model, test_model = dbn.build_finetune_functions(
         datasets=datasets,
         batch_size=batch_size,
-        lr=finetune_lr,
+        lr=learning_rate,
         mom=finetune_mom
     )
 
@@ -540,7 +515,7 @@ def test_DBN(finetune_lr=0.1, pretraining_epochs=200,
     improvement_threshold = 0.995  # a relative improvement of this much is
                                    # considered significant
     #validation_frequency = min(n_train_batches, patience / 2)
-    validation_frequency = n_train_batches / 2
+    validation_frequency = n_train_batches
                                   # go through this many
                                   # minibatches before checking the network
                                   # on the validation set; in this case we
@@ -553,12 +528,15 @@ def test_DBN(finetune_lr=0.1, pretraining_epochs=200,
     done_looping = False
     epoch = 0
 
-    while (epoch < training_epochs):# and (not done_looping):
+
+    while (epoch < training_epochs):
         if epoch % 20 == 10:
-            #print_meminfo()
-            print "current best test error: ", float(best_test_error_sum)/n_test_samples, ", achieved at epoch ", best_epoch
+            print(('    current best test error: %f, achieved at epoch %i, '
+                'current learning rate: %f') %
+                (float(best_test_error_sum)/n_test_samples, best_epoch, learning_rate.get_value().item()))
         epoch = epoch + 1
         time0 = time.time()
+        decay_learning_rate()
         for minibatch_index in xrange(n_train_batches):
 
             minibatch_avg_cost = train_fn(minibatch_index)
@@ -588,13 +566,6 @@ def test_DBN(finetune_lr=0.1, pretraining_epochs=200,
                 # if we got the best validation score until now
                 if this_validation_loss < best_validation_loss:
 
-                    #improve patience if loss improvement is good enough
-                    if (
-                        this_validation_loss < best_validation_loss *
-                        improvement_threshold
-                    ):
-                        patience = max(patience, iter * patience_increase)
-
                     # save best validation score and iteration number
                     best_validation_loss = this_validation_loss
                     best_test_error_sum = test_error_sum
@@ -604,10 +575,6 @@ def test_DBN(finetune_lr=0.1, pretraining_epochs=200,
                            'best model %f') %
                           (epoch, minibatch_index + 1, n_train_batches,
                            float(test_error_sum)/n_test_samples))
-
-            if patience <= iter:
-                done_looping = True
-                #break
 
     end_time = time.clock()
     print(

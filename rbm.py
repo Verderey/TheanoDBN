@@ -7,18 +7,14 @@ Stencil code provided by www.deeplearning.com/tutorial/code
 
 import time
 import os
-from collections import OrderedDict
+import random
 
 import numpy
 
 import theano
 import theano.tensor as T
-from theano.compat import six
 
-#from theano.tensor.shared_randomstreams import RandomStreams
 from theano.sandbox.rng_mrg import MRG_RandomStreams
-
-from logistic_sgd import load_data
 
 
 class RBM(object):
@@ -78,9 +74,9 @@ class RBM(object):
         scale = 0.8
 
         if W is None:
-            indices = range(n_in)
-            weights = numpy.zeros((n_in, n_out),dtype=theano.config.floatX)
-            for i in range(n_out):
+            indices = range(n_visible)
+            weights = numpy.zeros((n_visible, n_hidden),dtype=theano.config.floatX)
+            for i in range(n_hidden):
                 random.shuffle(indices)
                 for j in indices[:num_connections]:
                     weights[j,i] = random.gauss(0.0, scale)
@@ -254,16 +250,13 @@ class RBM(object):
         # note that we only need the sample at the end of the chain
         chain_end = nv_samples[-1]
 
-        rbm_cost = T.mean(self.free_energy(self.input)) - T.mean(
-            self.free_energy(chain_end))
+        rbm_cost = T.mean(self.free_energy(self.input)) - T.mean(self.free_energy(chain_end))
 
-        def rmsprop(cost, learning_rate, r=0.9, e=1e-2):
+        def rmsprop(cost, learning_rate, updates, r=0.9, epsilon=1e-2):
             rho = T.cast(r, dtype=theano.config.floatX)
-            epsilon = T.cast(e, dtype=theano.config.floatX)
             rFactor = T.cast(1.0, dtype=theano.config.floatX) - rho
             lrFactor = T.cast(1.0, dtype=theano.config.floatX) - momentum
 
-            updates = []
             oldUpdates = []
             oldMeanSquares = []
             for param in self.params:
@@ -282,14 +275,12 @@ class RBM(object):
                 paramUpdate = momentum * oldUpdate
                 meanSquare = rho * oldMeanSquare + rFactor * T.sqr(delta)
                 paramUpdate += - lrFactor * learning_rate * delta / T.maximum(T.sqrt(meanSquare), epsilon)
-                updates.append((oldMeanSquare, meanSquare))
+                updates[oldMeanSquare] = meanSquare
                 newParam = param + paramUpdate
-                updates.append((param, newParam))
-                updates.append((oldUpdate, paramUpdate))
+                updates[param] = newParam
+                updates[oldUpdate] = paramUpdate
 
-            return updates
-
-        def classicalMomentum(cost, learning_rate):
+        def classicalMomentum(cost, learning_rate, updates):
             # We must not compute the gradient through the gibbs sampling
             gparams = T.grad(cost, self.params, consider_constant=[chain_end])
 
@@ -300,7 +291,6 @@ class RBM(object):
                 gparams_mom.append(gparam_mom)
 
             # Update the step direction using momentum
-            updates = OrderedDict()
             for gparam_mom, gparam in zip(gparams_mom, gparams):
                 # change the update rule to match Hinton's dropout paper
                 updates[gparam_mom] = momentum * gparam_mom - (1. - momentum) * gparam * learning_rate
@@ -311,12 +301,10 @@ class RBM(object):
                 # here
                 updates[param] = param + updates[gparam_mom]
 
-            return updates
-
         if self.rmsprop:
-            updates = rmsprop(cost=rbm_cost, learning_rate=T.cast(lr, dtype=theano.config.floatX))
+            rmsprop(cost=rbm_cost, learning_rate=T.cast(lr, dtype=theano.config.floatX), updates=updates)
         else:
-            updates = classicalMomentum(cost=rbm_cost, learning_rate=T.cast(lr, dtype=theano.config.floatX))
+            classicalMomentum(cost=rbm_cost, learning_rate=T.cast(lr, dtype=theano.config.floatX), updates=updates)
 
         if persistent:
             # Note that this works only if persistent is a shared variable
@@ -389,7 +377,6 @@ class RBM(object):
 
         """
 
-        """
         cross_entropy = T.mean(
             T.sum(
                 self.input * T.log(T.nnet.sigmoid(pre_sigmoid_nv)) +
@@ -399,12 +386,39 @@ class RBM(object):
         )
 
         return cross_entropy
-        """
-        cost = T.sum(T.sqr(self.input - T.nnet.sigmoid(pre_sigmoid_nv)))
 
+
+class GBRBM(RBM):
+
+    # Implementation of Gaussian-Bernoulli RBM. Will need to use fewer training epochs
+    def __init__(self, input=None, n_visible=784, n_hidden=500, 
+                W=None, hbias=None, vbias=None, numpy_rng=None, 
+                theano_rng=None, rmsprop=True):
+        # initialize parent class (RBM)
+        RBM.__init__(self, input=input, n_visible=n_visible, n_hidden=n_hidden,
+                    W=W, hbias=hbias, vbias=vbias, numpy_rng=numpy_rng, 
+                    theano_rng=theano_rng, rmsprop=rmsprop)
+
+    def free_energy(self, v_sample):
+        wx_b = T.dot(v_sample, self.W) + self.hbias
+        vbias_term = 0.5*T.sum(T.sqr(v_sample - self.vbias), axis=1)
+        hidden_term = T.sum(T.log(1 + T.exp(wx_b)), axis=1)
+        return -hidden_term - vbias_term
+
+    def sample_v_given_h(self, h0_sample):
+        ''' This function infers state of visible units given hidden units '''
+        # compute the activation of the visible given the hidden sample
+        pre_sigmoid_v1, v1_mean = self.propdown(h0_sample)
+        v1_sample = self.theano_rng.normal(size=v1_mean.shape, avg=v1_mean, std=1.0, dtype=theano.config.floatX) + pre_sigmoid_v1
+        # use this instead if data is normalized to zero mean and 1 std
+        #v1_sample = pre_sigmoid_v1
+        return [pre_sigmoid_v1, v1_mean, v1_sample]
+
+    def get_reconstruction_cost(self, updates, pre_sigmoid_nv):
+        # cross-entropy will not be a good evaluation technique in this case;
+        # use squared error
+        cost = T.sum(T.sqr(self.input - pre_sigmoid_nv))
         return cost
-
-
 
 class DropoutRBM(RBM):
 
@@ -412,7 +426,7 @@ class DropoutRBM(RBM):
     # initialize class
     def __init__(self, input=None, n_visible=784, n_hidden=500, 
                 W=None, hbias=None, vbias=None, numpy_rng=None, 
-                theano_rng=None, rmsprop=True, hiddenDropout=1.0):
+                theano_rng=None, rmsprop=True, hiddenDropout=0.5):
 
         # initialize parent class (RBM)
         RBM.__init__(self, input=input, n_visible=n_visible, n_hidden=n_hidden,
@@ -420,7 +434,6 @@ class DropoutRBM(RBM):
                     theano_rng=theano_rng, rmsprop=rmsprop)
 
         self.hiddenDropout = hiddenDropout
-        self.weightScale = T.cast(1.0, dtype=theano.config.floatX) / T.cast(hiddenDropout, dtype=theano.config.floatX)
 
     def sample_h_given_v(self, v0_sample):
         ''' This function infers state of hidden units given visible units '''
@@ -428,13 +441,8 @@ class DropoutRBM(RBM):
         h1_sample = self.theano_rng.binomial(size=h1_mean.shape,
                                              n=1, p=h1_mean,
                                              dtype=theano.config.floatX)
-        drop_mask = self.theano_rng.binomial(n=1, p=self.hiddenDropout, size=h1_mean.shape)
-        h1_mean = h1_mean * T.cast(drop_mask, theano.config.floatX)
-        h1_sample = h1_sample * T.cast(drop_mask, theano.config.floatX)
+        drop_mask = self.theano_rng.binomial(n=1, p=self.hiddenDropout, 
+                                            size=h1_mean.shape, dtype=theano.config.floatX)
+        h1_mean = h1_mean * drop_mask
+        h1_sample = h1_sample * drop_mask
         return [pre_sigmoid_h1, h1_mean, h1_sample]
-
-    def propdown(self, hid):
-        '''This function propagates the hidden units activation downwards to
-        the visible units '''
-        pre_sigmoid_activation = self.weightScale * T.dot(hid, self.W.T) + self.vbias
-        return [pre_sigmoid_activation, T.nnet.sigmoid(pre_sigmoid_activation)]

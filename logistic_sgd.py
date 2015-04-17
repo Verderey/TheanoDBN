@@ -18,6 +18,7 @@ import gzip
 import os
 import sys
 import time
+from collections import OrderedDict
 
 import numpy
 
@@ -148,7 +149,6 @@ class LogisticRegression(object):
         else:
             raise NotImplementedError()
 
-
 def load_data(dataset):
     ''' Loads the dataset
 
@@ -187,12 +187,17 @@ def load_data(dataset):
     f = gzip.open(dataset, 'rb')
     train_set, valid_set, test_set = cPickle.load(f)
     f.close()
-    #train_set, valid_set, test_set format: tuple(input, target)
-    #input is an numpy.ndarray of 2 dimensions (a matrix)
-    #witch row's correspond to an example. target is a
-    #numpy.ndarray of 1 dimensions (vector)) that have the same length as
-    #the number of rows in the input. It should give the target
-    #target to the example with the same index in the input.
+
+    """"
+    # if we need to normalize for GBRBM
+    train_images, _ = train_set
+    valid_images, _ = valid_set
+    test_images, _ = test_set
+
+    for images in [train_images, valid_images, test_images]:
+        images -= images.mean(axis=0, keepdims=True)
+        images /= numpy.maximum(images.std(axis=0, keepdims=True), 3e-1)
+    """
 
     def shared_dataset(data_xy, borrow=False):
         """ Function that loads the dataset into shared variables
@@ -226,3 +231,183 @@ def load_data(dataset):
     rval = [(train_set_x, train_set_y), (valid_set_x, valid_set_y),
             (test_set_x, test_set_y)]
     return rval
+
+def sgd_optimization_mnist(lr=0.13, 
+                        n_epochs=1000,dataset='mnist.pkl.gz',
+                        batch_size=128, momentum=0.8):
+
+    dataset = '/mnt/Drive2/reuben/mnist/data/mnist.pkl.gz'
+    datasets = load_data(dataset)
+
+    learning_rate = theano.shared(value=numpy.asarray(lr, dtype=theano.config.floatX), name='learning_rate',borrow=True)
+    decay_learning_rate = theano.function(inputs=[], outputs=[], updates={learning_rate: learning_rate * 0.998})
+
+    train_set_x, train_set_y = datasets[0]
+    valid_set_x, valid_set_y = datasets[1]
+    test_set_x, test_set_y = datasets[2]
+
+    # compute number of minibatches for training, validation and testing
+    n_train_batches = train_set_x.get_value(borrow=True).shape[0] / batch_size
+    n_valid_batches = valid_set_x.get_value(borrow=True).shape[0] / batch_size
+    n_test_batches = test_set_x.get_value(borrow=True).shape[0] / batch_size
+
+    n_test_samples = test_set_x.get_value().shape[0]
+    n_valid_samples = valid_set_x.get_value().shape[0]
+
+    ######################
+    # BUILD ACTUAL MODEL #
+    ######################
+    print '... building the model'
+
+    # allocate symbolic variables for the data
+    index = T.lscalar()  # index to a [mini]batch
+
+    # generate symbolic variables for input (x and y represent a
+    # minibatch)
+    x = T.matrix('x')  # data, presented as rasterized images
+    y = T.ivector('y')  # labels, presented as 1D vector of [int] labels
+
+    # construct the logistic regression class
+    # Each MNIST image has size 28*28
+    classifier = LogisticRegression(input=x, n_in=28 * 28, n_out=10)
+
+    # the cost we minimize during training is the negative log likelihood of
+    # the model in symbolic format
+    cost = classifier.negative_log_likelihood(y)
+
+    # compiling a Theano function that computes the mistakes that are made by
+    # the model on a minibatch
+    test_model = theano.function(
+        inputs=[index],
+        outputs=classifier.errors(y),
+        givens={
+            x: test_set_x[index * batch_size: (index + 1) * batch_size],
+            y: test_set_y[index * batch_size: (index + 1) * batch_size]
+        }
+    )
+
+    validate_model = theano.function(
+        inputs=[index],
+        outputs=classifier.errors(y),
+        givens={
+            x: valid_set_x[index * batch_size: (index + 1) * batch_size],
+            y: valid_set_y[index * batch_size: (index + 1) * batch_size]
+        }
+    )
+
+    def classicalMomentum(cost, params):
+        # We must not compute the gradient through the gibbs sampling
+        gparams = T.grad(cost, params)
+
+        # ... and allocate mmeory for momentum'd versions of the gradient
+        gparams_mom = []
+        for param in params:
+            gparam_mom = theano.shared(numpy.zeros(param.get_value().shape, dtype=theano.config.floatX))
+            gparams_mom.append(gparam_mom)
+
+        # Update the step direction using momentum
+        updates = OrderedDict()
+        for gparam_mom, gparam in zip(gparams_mom, gparams):
+            # change the update rule to match Hinton's dropout paper
+            updates[gparam_mom] = momentum * gparam_mom - (1. - momentum) * gparam * learning_rate
+
+        # ... and take a step along that direction
+        for param, gparam_mom in zip(params, gparams_mom):
+            # since we have included learning_rate in gparam_mom, we don't need it
+            # here
+            updates[param] = param + updates[gparam_mom]
+
+        return updates
+
+    updates = classicalMomentum(cost=cost, params=classifier.params)
+
+    # compiling a Theano function `train_model` that returns the cost, but in
+    # the same time updates the parameter of the model based on the rules
+    # defined in `updates`
+    train_model = theano.function(
+        inputs=[index],
+        outputs=cost,
+        updates=updates,
+        givens={
+            x: train_set_x[index * batch_size: (index + 1) * batch_size],
+            y: train_set_y[index * batch_size: (index + 1) * batch_size]
+        }
+    )
+    # end-snippet-3
+
+    ###############
+    # TRAIN MODEL #
+    ###############
+    print '... training the model'
+    validation_frequency = n_train_batches
+
+    best_validation_loss = numpy.inf
+    test_score = 0.
+    start_time = time.clock()
+
+    done_looping = False
+    epoch = 0
+    while (epoch < n_epochs):
+        decay_learning_rate()
+        epoch = epoch + 1
+        for minibatch_index in xrange(n_train_batches):
+
+            minibatch_avg_cost = train_model(minibatch_index)
+            # iteration number
+            iter = (epoch - 1) * n_train_batches + minibatch_index
+
+            if (iter + 1) % validation_frequency == 0:
+                # compute zero-one loss on validation set
+                validation_losses = [validate_model(i)
+                                     for i in xrange(n_valid_batches)]
+                this_validation_loss = numpy.sum(validation_losses)
+
+                print(
+                    'epoch %i, minibatch %i/%i, validation error %f' %
+                    (
+                        epoch,
+                        minibatch_index + 1,
+                        n_train_batches,
+                        float(this_validation_loss)/n_valid_samples
+                    )
+                )
+
+                # if we got the best validation score until now
+                if this_validation_loss < best_validation_loss:
+
+                    best_validation_loss = this_validation_loss
+                    # test it on the test set
+
+                    test_losses = [test_model(i)
+                                   for i in xrange(n_test_batches)]
+                    test_score = numpy.sum(test_losses)
+
+                    print(
+                        (
+                            '     epoch %i, minibatch %i/%i, test error of'
+                            ' best model %f'
+                        ) %
+                        (
+                            epoch,
+                            minibatch_index + 1,
+                            n_train_batches,
+                            float(test_score)/n_test_samples
+                        )
+                    )
+
+    end_time = time.clock()
+    print(
+        (
+            'Optimization complete with best validation score of %f %%,'
+            'with test performance %f'
+        )
+        % (best_validation_loss * 100., float(test_score)/n_test_samples)
+    )
+    print 'The code run for %d epochs, with %f epochs/sec' % (
+        epoch, 1. * epoch / (end_time - start_time))
+    print >> sys.stderr, ('The code for file ' +
+                          os.path.split(__file__)[1] +
+                          ' ran for %.1fs' % ((end_time - start_time)))
+
+if __name__ == '__main__':
+    sgd_optimization_mnist()
