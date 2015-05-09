@@ -1,6 +1,7 @@
 """
-Author: Reuben Feinman
-CAML @ Symantec
+Author: 
+Reuben Feinman
+Brown University '15
 
 Stencil code provided by www.deeplearning.com/tutorial/code
 
